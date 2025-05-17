@@ -1,0 +1,7 @@
+*
+!.gitignore
+!*/
+!*.rs
+!*.md
+!Cargo.toml
+!Cargo.lock

@@ -1,0 +1,20 @@
+[package]
+name = "kek"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+atty = "0.2"
+globset = { version = "0.4", default-features = false, features = ["simd-accel"] }
+ignore = { version = "0.4", features = ["simd-accel"] }
+lockfree = "0.5.1"
+mimalloc = "0.1"
+rustc-hash = "2.1"
+rustix = { version = "1.0", features = ["fs", "stdio"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
