@@ -1,39 +1,43 @@
 # kek 
 
-A repository serializer inspired by yek.
+A repository serializer inspired by [yek](https://github.com/bodo-run/yek).
+
+#### Features
+- Outputs pseudo-XML.
+- Uses `sendfile` for blazingly fast performance.
+- Categorises files as `docs`, `src` or `other` (helps the model).
+- Respects `.gitignore` and `.kekignore`
 
 ## Usage
 
-### Basic Command
-
-The program's output **must** be piped to another command or redirected to a file. Running it directly with output to a TTY will result in an error.
+Serialize the repository and write to the clipboard
 
 ```bash
-./kek |
-```
-Or redirect to a file:
-```bash
-./kek > output.xml
+kek | clip.exe
 ```
 
-The program processes files in the current working directory by default.
-
-### Task Arguments
-
-You can pass additional arguments to `kek`. These arguments will be joined by spaces and included in the output within `<task>...</task>` tags.
+Add a task prompt
 
 ```bash
-./kek some important context for this run |
+kek "Optimize code." | clip.exe # Adds <task>Optimize code.</task> at the end of the output.
 ```
 
-This would append `<task>some important context for this run</task>` to the output.
+Debug which files are included
+```bash
+kek | grep -A2 "<path>"
+```
 
 ## Configuration
 
-Configuration is managed via a TOML file, by default named `kek.toml` in the current working directory. Alternatively, the path to the configuration file can be specified using the `KEK_CONFIG` environment variable.
+Configuration is managed via `kek.toml`. Alternatively, the path can be specified using the `KEK_CONFIG` environment variable.
 
 ```toml
 # Example kek.toml
+
+scan = [
+    "../migrations", # include shared SQL migrations
+    "." # include this project's files
+]
 
 [category]
 # Globs for the 'docs' category.
