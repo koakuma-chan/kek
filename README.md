@@ -1,6 +1,6 @@
 # kek 
 
-A repository serialized inspired by yek.
+A repository serializer inspired by yek.
 
 ## Usage
 
