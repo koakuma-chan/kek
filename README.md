@@ -8,6 +8,12 @@ A repository serializer inspired by [yek](https://github.com/bodo-run/yek).
 - Categorises files as `docs`, `src` or `other` (helps the model).
 - Respects `.gitignore` and `.kekignore`
 
+## Installation
+
+```bash
+cargo install --git https://github.com/koakuma-chan/kek
+```
+
 ## Usage
 
 Serialize the repository and write to the clipboard
