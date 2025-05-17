@@ -1,7 +1,5 @@
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-
 use serde::Deserialize;
-
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -13,18 +11,8 @@ pub const OTHER_DESCRIPTION: &str = "Other files.";
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct TomlCategoryGlobs {
-    /// Defines glob patterns for the 'docs' category. Overrides defaults if specified.
-    /// Globs match against relative file paths, case-insensitively.
-    /// With globset, '*' by default does not match hidden files like '.foo.md'.
-    /// If you need to match hidden files, ensure your pattern accounts for it (e.g., ".*.md").
-    /// Default "*.ext" patterns are automatically expanded to include ".*.ext".
-    /// Example: ["*.md", "docs/**/*.txt", "LICENSE"]
     #[serde(default = "default_docs_globs_str_vec")]
     docs: Vec<String>,
-    /// Defines glob patterns for the 'src' category. Overrides defaults if specified.
-    /// Globs match against relative file paths, case-insensitively.
-    /// See 'docs' for notes on matching hidden files.
-    /// Example: ["*.rs", "src/**/*.js", "Makefile"]
     #[serde(default = "default_src_globs_str_vec")]
     src: Vec<String>,
 }
@@ -43,9 +31,16 @@ impl Default for TomlCategoryGlobs {
 #[serde(deny_unknown_fields)]
 struct TomlConfig {
     /// Contains specifications for glob patterns belonging to different categories.
-    /// If this table is omitted, default glob patterns for 'docs' and 'src' will be used.
     #[serde(default)]
     category: TomlCategoryGlobs,
+    /// List of directories to scan. Paths can be absolute or relative to the current working directory.
+    /// If omitted, defaults to the current working directory ["."].
+    #[serde(default = "default_scan_str_vec")]
+    scan: Vec<String>,
+}
+
+fn default_scan_str_vec() -> Vec<String> {
+    vec![".".to_string()]
 }
 
 // --- Default Glob Pattern Lists ---
@@ -313,11 +308,11 @@ fn default_src_globs_str_vec() -> Vec<String> {
 }
 
 /// Application configuration, derived from `TomlConfig`.
-/// Contains compiled glob patterns for 'docs' and 'src' categories for efficient matching.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub docs: GlobSet,
     pub src: GlobSet,
+    pub scan: Vec<PathBuf>,
 }
 
 /// Helper function to build a GlobSet from a list of pattern strings.
@@ -327,13 +322,9 @@ fn build_glob_set(glob_strings: &[String], category_name: &str) -> Result<GlobSe
     for glob_str in glob_strings {
         // Business Logic Constraint: Globs are case-insensitive.
         // Business Logic Constraint: '*' in globs can match path separators like '/'.
-        // This behavior matches the previous `require_literal_separator: false`.
-        // Note on `globset` and leading dots: By default, `*` doesn't match names starting with `.`.
-        // Default `*.ext` patterns are expanded to `*.ext` and `.*.ext` to cover this.
-        // User-provided patterns must be explicit if they need to match leading dots (e.g., `.*.log`).
         let glob = GlobBuilder::new(glob_str)
-            .case_insensitive(true) // Match case-insensitively
-            .literal_separator(false) // Allows * to match /
+            .case_insensitive(true)
+            .literal_separator(false)
             .build()
             .map_err(|e| {
                 format!(
@@ -348,11 +339,16 @@ fn build_glob_set(glob_strings: &[String], category_name: &str) -> Result<GlobSe
         .map_err(|e| format!("Failed to build glob set for '{}': {}", category_name, e))
 }
 
-/// Loads the application configuration from the TOML file specified by the KEK_CONFIG environment variable.
+/// Loads the application configuration from the TOML file specified by the KEK_CONFIG environment variable,
+/// or `kek.toml` by default.
 ///
-/// The configuration file can specify lists of glob patterns for 'docs' and 'src' categories.
-/// If the configuration file doesn't exist or if not specified in the file, default lists of
-/// glob patterns are used.
+/// The configuration file can specify:
+/// - `scan`: A list of paths to scan. Defaults to `["."]` (current working directory).
+///   Paths are relative to the current working directory unless absolute.
+/// - `category.docs`: Glob patterns for 'docs' category.
+/// - `category.src`: Glob patterns for 'src' category.
+///
+/// If the configuration file doesn't exist or specific settings are omitted, defaults are used.
 ///
 /// Business Logic Constraint: Glob patterns are matched case-insensitively against relative file paths.
 /// Business Logic Constraint: Glob compilation errors will cause configuration loading to fail.
@@ -360,8 +356,7 @@ pub fn load_config() -> Result<AppConfig, String> {
     let config_path_str = env::var("KEK_CONFIG").unwrap_or_else(|_| "kek.toml".to_string());
     let config_path = PathBuf::from(config_path_str);
 
-    // Default configuration when file doesn't exist
-    let toml_config = if !config_path.exists() {
+    let toml_config: TomlConfig = if !config_path.exists() {
         TomlConfig::default()
     } else {
         let config_content = fs::read_to_string(&config_path)
@@ -375,12 +370,31 @@ pub fn load_config() -> Result<AppConfig, String> {
         })?
     };
 
-    let docs = build_glob_set(&toml_config.category.docs, "docs")?;
-    let src = build_glob_set(&toml_config.category.src, "src")?;
+    let docs_globset = build_glob_set(&toml_config.category.docs, "docs")?;
+    let src_globset = build_glob_set(&toml_config.category.src, "src")?;
+
+    let scan: Vec<PathBuf> = toml_config
+        .scan
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    
+    // Business Logic Constraint: If scan is empty after parsing (e.g. user provided empty list),
+    // it should behave as if default ["."] was used.
+    let scan = if scan.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        scan
+    };
+
 
     // Business Logic Constraint: A file path will be categorized by the first matching glob list,
     // in the order of 'docs', then 'src'. If a file matches globs from both lists,
     // it will be categorized as 'docs' due to this precedence.
 
-    Ok(AppConfig { docs, src })
+    Ok(AppConfig {
+        docs: docs_globset,
+        src: src_globset,
+        scan
+    })
 }

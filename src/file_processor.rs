@@ -1,12 +1,11 @@
 use crate::config::{AppConfig, DOCS_DESCRIPTION, OTHER_DESCRIPTION, SRC_DESCRIPTION};
 
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, Component};
+use std::fs;
 
 use lockfree::stack::Stack;
-
 use ignore::WalkBuilder;
-
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug)]
 pub struct FileData {
@@ -22,20 +21,57 @@ pub struct CategoryData {
     pub total_size: u64,
 }
 
-/// Strips the base path from a full path to get a relative path.
-fn get_relative_path(base: &Path, full_path: &Path) -> Result<PathBuf, String> {
-    full_path
-        .strip_prefix(base)
-        .map(|p| p.to_path_buf())
-        .map_err(|e| {
-            format!(
-                "Failed to create relative path for {:?} (base {:?}): {}",
-                full_path, base, e
-            )
-        })
+/// Creates a relative path from `base` to `target_path`.
+/// Handles cases where `target_path` is not a direct descendant of `base` by using `../`.
+/// Both paths should ideally be canonicalized before calling this function for robustness.
+fn create_relative_path(base: &Path, target_path: &Path) -> Result<PathBuf, String> {
+    // Attempt simple stripping first, common case if target is under base.
+    if let Ok(stripped) = target_path.strip_prefix(base) {
+        if stripped.as_os_str().is_empty() { // Path is same as base
+             return Ok(PathBuf::from("."));
+        }
+        return Ok(stripped.to_path_buf());
+    }
+
+    let base_comps: Vec<Component<'_>> = base.components().collect();
+    let target_comps: Vec<Component<'_>> = target_path.components().collect();
+
+    let mut common_prefix_len = 0;
+    while common_prefix_len < base_comps.len()
+        && common_prefix_len < target_comps.len()
+        && base_comps[common_prefix_len] == target_comps[common_prefix_len]
+    {
+        common_prefix_len += 1;
+    }
+
+    let mut rel_path = PathBuf::new();
+
+    for _ in common_prefix_len..base_comps.len() {
+        if base_comps[common_prefix_len..].iter().all(|c| matches!(c, Component::CurDir)) {
+            continue;
+        }
+        rel_path.push(Component::ParentDir);
+    }
+    
+    for comp_idx in common_prefix_len..target_comps.len() {
+        match target_comps[comp_idx] {
+            Component::RootDir | Component::Prefix(_) => {
+                if rel_path.as_os_str().is_empty() && comp_idx +1 == target_comps.len() {
+                    return Ok(PathBuf::from("."));
+                }
+            }
+            _ => rel_path.push(target_comps[comp_idx]),
+        }
+    }
+    
+    if rel_path.as_os_str().is_empty() {
+        Ok(PathBuf::from("."))
+    } else {
+        Ok(rel_path)
+    }
 }
 
-/// Represents the three fixed categories for files.
+
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 enum FileCategoryType {
     Docs,
@@ -44,7 +80,6 @@ enum FileCategoryType {
 }
 
 impl FileCategoryType {
-    /// Gets the fixed description for this category type.
     fn get_description(&self) -> &'static str {
         match self {
             FileCategoryType::Docs => DOCS_DESCRIPTION,
@@ -54,12 +89,6 @@ impl FileCategoryType {
     }
 }
 
-/// Determines the category of a file based on its relative path and the application configuration globs.
-///
-/// Business Logic Constraint: Glob patterns are matched case-insensitively against the relative path.
-/// Business Logic Constraint: 'docs' globs are checked first. If a match, categorized as 'Docs'.
-/// Else, 'src' globs are checked. If a match, categorized as 'Src'.
-/// Otherwise, the file is categorized as 'Other'.
 fn categorize_file(relative_path: &Path, config: &AppConfig) -> FileCategoryType {
     if config.docs.is_match(relative_path) {
         return FileCategoryType::Docs;
@@ -70,87 +99,135 @@ fn categorize_file(relative_path: &Path, config: &AppConfig) -> FileCategoryType
     FileCategoryType::Other
 }
 
-/// Processes all files in the working directory, categorizes them, and prepares data for output.
-///
-/// 1. Walks the directory (respecting ignore files like .gitignore, .kekignore) to find all files.
-/// 2. For each file, determines its category ('docs', 'src', or 'other') based on matching its
-///    relative path against configured glob patterns. Also retrieves file size.
-/// 3. Groups files by these categories. Files within categories are not explicitly sorted further;
-///    their order depends on the parallel directory traversal.
-/// 4. Creates `CategoryData` for each of the three fixed categories if they contain any files.
-///    Calculates total file size for each category.
-/// 5. Returns a list of `CategoryData` (for non-empty categories) sorted by their `total_size`
-///    in descending order (largest categories first). If categories have the same total size,
-///    their relative order is not strictly defined beyond the initial processing order.
-///
-/// Business Logic Constraint: Categories with no matching files are omitted from the output.
-/// Business Logic Constraint: File metadata (like size) read errors for individual files will result in overall processing failure.
 pub fn process_all_categories(
     config: &AppConfig,
-    working_dir: &Path,
+    working_dir: &Path, 
 ) -> Result<Vec<CategoryData>, String> {
-    let mut walk_builder = WalkBuilder::new(working_dir);
-    walk_builder
-        .standard_filters(true)
-        .add_custom_ignore_filename(".kekignore");
+    
+    let categorized_results_stack = Stack::<Result<(FileCategoryType, FileData), String>>::new();
+    
+    let canonical_working_dir = working_dir.canonicalize().map_err(|e| {
+        format!(
+            "Failed to canonicalize working directory {:?}: {}",
+            working_dir, e
+        )
+    })?;
 
-    // Use a thread-safe collection for results
-    let categorized_results = Stack::<Result<(FileCategoryType, FileData), String>>::new();
-    let config_ref = config;
-    let working_dir_ref = working_dir;
+    let mut walk_builder_opt: Option<WalkBuilder> = None;
+    let mut has_valid_scan_paths = false;
 
-    // Process entries directly in the walker
+    for scan_dir_config_path in &config.scan {
+        let current_scan_target_abs = if scan_dir_config_path.is_absolute() {
+            scan_dir_config_path.clone()
+        } else {
+            working_dir.join(scan_dir_config_path)
+        };
+
+        let canonical_scan_root = match fs::canonicalize(&current_scan_target_abs) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "[WARNING] Failed to canonicalize scan directory {:?} (configured as {:?}): {}. Skipping.",
+                    current_scan_target_abs, scan_dir_config_path, e
+                );
+                continue;
+            }
+        };
+
+        if !canonical_scan_root.is_dir() {
+            eprintln!(
+                "[WARNING] Scan path {:?} (configured as {:?}, resolved to {:?}) is not a directory. Skipping.",
+                scan_dir_config_path, current_scan_target_abs, canonical_scan_root
+            );
+            continue;
+        }
+        
+        has_valid_scan_paths = true;
+
+        match walk_builder_opt.as_mut() {
+            Some(builder) => {
+                builder.add(canonical_scan_root);
+            }
+            None => {
+                let mut new_builder = WalkBuilder::new(canonical_scan_root);
+                new_builder
+                    .standard_filters(true) 
+                    .add_custom_ignore_filename(".kekignore");
+                walk_builder_opt = Some(new_builder);
+            }
+        }
+    }
+
+    if !has_valid_scan_paths || walk_builder_opt.is_none() {
+        eprintln!("[INFO] No valid scan directories to process.");
+        return Ok(Vec::new()); // No valid paths to walk, return empty
+    }
+
+    // We can unwrap here because has_valid_scan_paths ensures walk_builder_opt is Some
+    let walk_builder = walk_builder_opt.unwrap();
+    
+    // References for the parallel closure
+    let config_ref = config; 
+    let canonical_working_dir_ref = &canonical_working_dir;
+    let results_stack_ref = &categorized_results_stack;
+
     walk_builder.build_parallel().run(|| {
-        // Create references for this thread
-        let results = &categorized_results;
-        let config = config_ref;
-        let working_dir = working_dir_ref;
+        let thread_local_config = config_ref;
+        let thread_local_canonical_cwd = canonical_working_dir_ref;
+        let thread_local_results_stack = results_stack_ref;
 
         Box::new(move |entry_result| {
             match entry_result {
                 Ok(entry) => {
                     if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                        // Process the entry directly here
-                        let absolute_path = entry.path().to_path_buf();
+                        let path_from_walker = entry.path();
+                        
+                        let file_absolute_path_canonical = match fs::canonicalize(path_from_walker) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Failed to canonicalize path for file {:?}: {}. Skipping file.",
+                                    path_from_walker, e
+                                );
+                                return ignore::WalkState::Continue;
+                            }
+                        };
 
-                        // Get metadata and file size
                         let metadata = match entry.metadata() {
                             Ok(md) => md,
                             Err(e) => {
                                 eprintln!(
-                                    "Warning: Failed to get metadata for file {:?}: {}",
-                                    absolute_path, e
+                                    "Warning: Failed to get metadata for file {:?}: {}. Skipping file.",
+                                    file_absolute_path_canonical, e
                                 );
                                 return ignore::WalkState::Continue;
                             }
                         };
                         let file_size = metadata.len();
 
-                        // Get relative path and categorize
-                        let relative_path = match get_relative_path(working_dir, &absolute_path) {
+                        let relative_path_to_cwd = match create_relative_path(thread_local_canonical_cwd, &file_absolute_path_canonical) {
                             Ok(path) => path,
-                            Err(e) => {
-                                eprintln!("Warning: {}", e);
+                            Err(e_str) => {
+                                eprintln!(
+                                    "Warning: Failed to create relative path for {:?} (base {:?}): {}. Skipping file.",
+                                    file_absolute_path_canonical, thread_local_canonical_cwd, e_str
+                                );
                                 return ignore::WalkState::Continue;
                             }
                         };
-
-                        let category_type = categorize_file(&relative_path, config);
-                        let result = Ok((
-                            category_type,
-                            FileData {
-                                relative_path,
-                                absolute_path,
-                                size: file_size,
-                            },
-                        ));
-
-                        // Push the processed result
-                        results.push(result);
+                        
+                        let category_type = categorize_file(&relative_path_to_cwd, thread_local_config);
+                        
+                        let file_data = FileData {
+                            relative_path: relative_path_to_cwd,
+                            absolute_path: file_absolute_path_canonical,
+                            size: file_size,
+                        };
+                        thread_local_results_stack.push(Ok((category_type, file_data)));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warning: Error walking directory: {}", e);
+                    eprintln!("Warning: Error walking directory entry: {}", e);
                 }
             }
             ignore::WalkState::Continue
@@ -158,17 +235,25 @@ pub fn process_all_categories(
     });
 
     let mut grouped_files: FxHashMap<FileCategoryType, Vec<FileData>> = FxHashMap::default();
-    for result in categorized_results {
-        let (category_type, file_data) = result?;
-        grouped_files
-            .entry(category_type)
-            .or_default()
-            .push(file_data);
+    let mut processed_abs_paths: FxHashSet<PathBuf> = FxHashSet::default();
+
+    for result in categorized_results_stack {
+        match result {
+            Ok((category_type, file_data)) => {
+                if processed_abs_paths.insert(file_data.absolute_path.clone()) {
+                    grouped_files
+                        .entry(category_type)
+                        .or_default()
+                        .push(file_data);
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERROR] An error occurred during file data collection: {}", e);
+            }
+        }
     }
 
     let mut all_category_data = Vec::new();
-    // Define the order for processing categories to ensure consistent behavior if sizes are equal,
-    // though final sort is by size.
     let category_types_to_consider = [
         FileCategoryType::Docs,
         FileCategoryType::Src,
@@ -176,13 +261,8 @@ pub fn process_all_categories(
     ];
 
     for cat_type in category_types_to_consider.iter() {
-        // Use .remove() if the order from category_types_to_consider is the desired iteration order
-        // and we want to consume the entries from the map.
-        // Or use .get() if we want to iterate in a specific order but keep the map intact for some reason
-        // (not needed here).
         if let Some(files) = grouped_files.remove(cat_type) {
-            // Business Logic Constraint: Files within a category are not explicitly sorted.
-            // Their order is determined by the parallel directory traversal and subsequent collection.
+            if files.is_empty() { continue; }
             let total_category_size: u64 = files.iter().map(|f| f.size).sum();
             all_category_data.push(CategoryData {
                 description_text: cat_type.get_description().to_string(),
@@ -190,15 +270,8 @@ pub fn process_all_categories(
                 total_size: total_category_size,
             });
         }
-        // If a category type from category_types_to_consider had no files, it simply won't be found in
-        // grouped_files, and nothing will be added to all_category_data for it, which is desired.
     }
 
-    // Business Logic Constraint: Categories are sorted by total_size descending.
-    // Larger categories appear first.
-    // Tie-breaking for categories with identical total_size is based on the order
-    // they were added to `all_category_data`, which in turn depends on `category_types_to_consider`
-    // and then the order from `grouped_files.remove()`.
     all_category_data.sort_by(|a, b| b.total_size.cmp(&a.total_size));
 
     Ok(all_category_data)
