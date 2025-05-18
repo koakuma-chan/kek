@@ -38,7 +38,7 @@ kek | grep -A2 "<path>"
 Configuration is managed via `kek.toml`. Alternatively, the path can be specified using the `KEK_CONFIG` environment variable.
 
 ```toml
-# Example kek.toml
+# Example kek.toml (these aren't the defaults)
 
 scan = [
     "../migrations", # include shared SQL migrations
